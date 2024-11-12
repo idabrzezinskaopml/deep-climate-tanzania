@@ -1,0 +1,241 @@
+---
+title: "Tanzania flood updated"
+output: html_document
+date: "2024-09-16"
+---
+
+This script uses flood and household data to identify historically flooded households in Tanzania. It spatially joins GPS coordinates of households with raster layers showing flooded areas in Tanzania. The match is done at the location of the coordinates, as well as within a specified radius of the coordinates. 
+
+Things to improve:
+- Loop over years of the survey
+
+## Attach packages
+
+```{r packages}
+library("plyr")                     # Load plyr package
+library("dplyr")                    # Data manipulation
+library("readr")                    # Load and export csv files
+library("raster")                   # Raster data
+library("haven")                    # Load dta files
+library("foreign")                  # Export dta files
+library("sf")                       # Spatial features
+library("exactextractr")            # Zonal statistics using geo-spatial data
+
+```
+
+## LOAD HOUSEHOLD DATA ##
+
+Load three waves of the cross-sectional household survey in Tanzania. The file contains household ID and longitude and latitude of the household location.
+
+```{r}
+# Set directory
+setwd("C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Household/Geocoordinates Vidya/Newer version")
+
+# Import data file with coordinates of households 
+TZ_geo_Y1 <- read_dta("geovar1.dta")
+TZ_geo_Y2 <- read_dta("geovar2.dta")
+TZ_geo_Y3 <- read_dta("geovar3.dta")
+
+# Make a data frame with just coordinates
+coordinates_Y1 <- TZ_geo_Y1[, c("lon_dd_mod", "lat_dd_mod")]
+coordinates_Y2 <- TZ_geo_Y2[, c("lon_dd_mod", "lat_dd_mod")]
+coordinates_Y3 <- TZ_geo_Y3[, c("lon_dd_mod", "lat_dd_mod")]
+
+```
+
+## IMPORT FLOOD DATA ##
+
+Flood data is taken from the Global Flood Database, a flood repository at 250m spatial resolution: https://global-flood-database.cloudtostreet.ai/#interactive-map
+
+I import all flood events in Tanzania between 2007-2018 and convert them into a raster (keeping only the "flooded" layer). The "flooded" variable is a binary indicating whether a grid cell was flooded or not during the event. 
+
+```{r Import TIF files}
+# Set the working directory to TIF files
+setwd("C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Floods")
+
+# Create a list of TIF files using the DFO pattern and save as data frames
+DFO_files <- list.files(pattern = ".tif",
+                           full.names = TRUE,
+                        recursive=T) %>%
+  lapply(raster)
+
+```
+
+## IDENTIFY FLOODED HOUSEHOLDS AT THE EXACT GPS COORDINATES ##
+
+This function uses geo-coordinates of households to check if there was a flood in the precise GPS location of the household. It follows these steps:
+
+1. Extract the full date of the flood event
+2. Extract the value of the raster at the location of the coordinates
+3. Append flood information to a data frame 
+4. Return data frame
+
+It needs the following arguments to be supplied:
+- flood.raster --> raster file with flooded areas
+- coordinates --> data frame with longitude and latitude of households
+- dataframe --> data frame with household ID and GPS coordinates, to which the flood information will be joined
+
+
+```{r Create data frames}
+# Test to get a function first 
+flood_exact_location <- function(flood.raster, coordinates, dataframe) {
+  
+  # 1. Extract the full date of the flood event 
+  fulldate <- substr(flood.raster@file@name, 116, 123) 
+  
+  # 2. extract the value of the raster at the location of the coordinates
+  raster_values <- extract(flood.raster, coordinates)  
+  
+  # 3. Append flood information to a data frame 
+  dataframe$new_column <- raster_values   # create a column to store flood values
+  dataframe[,"new_column"][is.na(dataframe[,"new_column"])] <- 0 # replacing missing values with 0s
+  names(dataframe)[names(dataframe) == 'new_column'] <- paste("f", fulldate, sep="_") # rename column according to the day of the flood
+  
+  # 4. Return data frame
+  return(dataframe)
+  
+}
+
+```
+
+Apply function to household data across three time periods and all flood events. Repeat for every year of the survey. 
+
+Note: Given the high spatial resolution of the flood data, this results in a very low proportion of households being "treated" (less than 1% of the sample). This is expected, as households would need to reside specifically in the inundated area, which is quite rare with this flood product. 
+
+```{r}
+## YEAR 1 
+
+# Store the length of the list with raster files - this gives the total number of flood events 
+num_rasters <- 1:length(DFO_files)
+
+# Loop over all flood events 
+for (i in num_rasters) {
+
+TZ_geo_Y1 <- flood_exact_location(flood.raster=DFO_files[[i]], coordinates=coordinates_Y1, dataframe=TZ_geo_Y1)
+
+}
+
+# Have a look at the data frame
+summary(TZ_geo_Y1)
+
+## YEAR 2
+
+# Loop over all flood events 
+for (i in num_rasters) {
+
+TZ_geo_Y2 <- flood_exact_location(flood.raster=DFO_files[[i]], coordinates=coordinates_Y2, dataframe=TZ_geo_Y2)
+
+}
+
+# Have a look at the data frame
+summary(TZ_geo_Y2)
+
+## YEAR 3
+
+# Loop over all flood events 
+for (i in num_rasters) {
+
+TZ_geo_Y3 <- flood_exact_location(flood.raster=DFO_files[[i]], coordinates=coordinates_Y3, dataframe=TZ_geo_Y3)
+
+}
+
+# Have a look at the data frame
+summary(TZ_geo_Y3)
+
+```
+
+
+## IDENTIFY FLOODED HOUSEHOLD WITHIN A RADIUS OF THEIR EXACT LOCATION ##
+
+First, we need to turn the data frame with coordinates of households from each year into a "spatial" data frame, where the values of longitude and latitude become indexed in space. This requires specifying the geographical projection (crs), i.e. the projection which specifies how spatial data is displayed on a two-dimensional map. 4326 is the standard projection, the World Geodetic System 84 projection.
+
+```{r}
+# Turn coordinates into a spatial points frame 
+points_sf_Y1 <- st_as_sf(coordinates_Y1, coords = c('lon_dd_mod', 'lat_dd_mod'), crs = 4326)
+points_sf_Y2 <- st_as_sf(coordinates_Y2, coords = c('lon_dd_mod', 'lat_dd_mod'), crs = 4326)
+points_sf_Y3 <- st_as_sf(coordinates_Y3, coords = c('lon_dd_mod', 'lat_dd_mod'), crs = 4326)
+```
+
+This function will use a raster file with flooded areas and coordinates of households to identify all flooded households within a specified radius. It will output a data frame where a binary column for each flood event has been added, either indicating the presence of flood "1", or no flood "O". The function requires the following arguments:
+
+- flood.raster --> raster file showing flooded areas
+- coordinates --> spatial data frame with longitude and latitude of household locations
+- dataframe --> data frame with household ID and GPS coordinates, to which the flood information will be joined
+- distance --> the radius (in meters), within which the function is to identify flood-affected areas (e.g. 10000 would mean identifying a flood area within a 10km radius of the household location)
+
+The function follows these steps:
+1. Creating a buffer around a household within the radius specified (e.g. 10 km) and outputting a spatial features object with polygons of the buffer zone (i.e. circles drawn around the GPS location)
+2. Calculating zonal statistics (max) in each of the buffer zones from the flood raster. The function will always take the maximum value of the raster within the buffer zone, i.e. if there is any flood within the radius - the function will identify the household as flooded 
+3. Add columns to the data frame with household ID and GPS in the format: f_YYYYMMDD_10km - a binary variable indicating whether the household was flooded in a flood event which started on date YYYYMMDD, using the 10km (or other) radius. 
+
+```{r}
+
+# Function for automating the processing of geo-spatial covariates for use in poverty modelling
+flood_radius <- function(flood.raster, coordinates, distance, name, dataframe) {
+  
+    # 1. Create a buffer around the coordinates
+    points_buffer <- st_buffer(coordinates, dist = distance)
+    radius <- substr(distance, 1,2) # extract the first two elements of the distance argument
+    radius <- paste(radius, "km")  # add "km" 
+    fulldate <- substr(flood.raster@file@name, 116, 123)  # extract the full data of the flood 
+    
+    # 2. Calculate zonal statistics - max 
+    zonal_stats <- exact_extract(flood.raster, points_buffer, fun = c('max')) # Calculate the max value of the raster     within each radius
+    
+    # 3. Add flood variables to the data frame
+    dataframe$new_column <- zonal_stats   # add a binary variable indicating the presence of flooding 
+    dataframe[,"new_column"][is.na(dataframe[,"new_column"])] <- 0 # replacing missing values with 0s
+    names(dataframe)[names(dataframe) == 'new_column'] <- paste("f", fulldate, radius, sep="_") # name the column according to the date of the flood event 
+    return(dataframe)
+    
+}
+
+
+```
+
+Example with a 10 km radius, repeated for three years of the survey. I use the function to loop over all flood events between 2007-2018. 
+
+Note: replace the distance with another value to change the radius (e.g. selecting distance=50000 would identify whether there was a flood within 50km radius of the housheold location)
+
+```{r}
+# Apply the function to the data frame in year 1 using the 10km radius 
+
+num_rasters <- 1:length(DFO_files)
+
+for (i in num_rasters) {
+
+TZ_geo_Y1 <- flood_radius(flood.raster=DFO_files[[i]], coordinates=points_sf_Y1, distance=10000, dataframe=TZ_geo_Y1)
+
+}
+# Have a look at the data frame
+
+summary(TZ_geo_Y1)
+
+# Year 2
+num_rasters <- 1:length(DFO_files)
+
+for (i in num_rasters) {
+
+TZ_geo_Y3 <- flood_radius(flood.raster=DFO_files[[i]], coordinates=points_sf_Y3, distance=10000, dataframe=TZ_geo_Y3)
+
+}
+
+# Have a look at the data frame
+summary(TZ_geo_Y3)
+
+```
+
+
+## SAVE DATA ##
+
+```{r}
+# Year 1
+write.dta(TZ_geo_Y1, "C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Household/Geocoordinates Vidya/Processed with flood/geovar1_flood.dta")
+
+# Year 2
+write.dta(TZ_geo_Y2, "C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Household/Geocoordinates Vidya/Processed with flood/geovar2_flood.dta")
+
+# Year 3
+write.dta(TZ_geo_Y3, "C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Household/Geocoordinates Vidya/Processed with flood/geovar3_flood.dta")
+```
+

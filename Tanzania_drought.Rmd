@@ -1,0 +1,878 @@
+---
+title: "Calculating the drought index (SPEI) for Nigeria "
+output: html_document
+date: '2022-08-22'
+notes: The aim is to construct SPEI (standardised precipitation evapo-transpiration index) for Nigeria. SPEI is a multi-scalar index indicating drought conditions. It is calculated as the difference between precipitation and PET (potential evapotranspiration). Climate data is taken from the CRU (Climatic Research Unit) Version 4 gridded dataset and contains monthly values of PET and precipitation on a 0.5 degrees regular grid over the period 1981-2020. 
+---
+```{r Load R libraries, include=FALSE}
+library("plyr")                     # Load plyr package
+library("dplyr")                   # Load dplyr package
+library("readr")                    # Load readr package
+library("tidyr")                    # Data manipulation
+library("ncdf4")                    # package for netcdf manipulation
+library("raster")                   # package for raster manipulation
+library("rgdal")                    # package for geospatial analysis
+library("ggplot2")                  # package for plotting
+library("stargazer")                # For LaTeX tables
+library("AER")                      # Robust standard errors
+library("rworldmap")                # Mapping country boundaries
+library("leaflet")                  # Fancy interactive maps
+library("chron")                    # Manipulating the time variable in a netCDF file
+library("lattice")                  # netCDF files
+library("RColorBrewer")             # net CDF files
+library("reshape2")                 # reshape long
+library("haven")                    # Load dta files
+library("SPEI")                     # SPEI construction
+library("foreign")                  # Export dta files
+library("vctrs")                    # Vector operations
+
+```
+
+
+## 1. PET (potential evapo-transpiration) data ##
+
+Load the PET data (potential evapo-transpiration) merged netCDF file. This data has been merged using cdo climate operators package in Linux and has monthly values of PET for the years 1981-2020 on regular 0.5 degree grid.
+
+Note: need to think about how to account for different time steps. Given we have 12 months x 40 years - should we reshape long?
+
+```{r Load netCDF files, include=FALSE}
+# Set the working directory to netCDF files 
+setwd("C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Poverty Nigeria/Data/CRU Version 4 Climate Data/PET (Potential evapo-transpiration)/Raw data")
+
+# Open the netCDF file. This has already been merged and covers the period 1981-2020. It contains 480 time steps (12 months across 40 years)
+pet_data <- nc_open("merged_pet.nc", write=FALSE, readunlim=TRUE, verbose=FALSE, 
+ 	auto_GMT=TRUE, suppress_dimvals=FALSE, return_on_error=FALSE )
+
+# Data has three dimensions: lon, lat, and time. The variable of interest is "pet" 
+
+# Extract variables - three dimensions 
+lon <- ncvar_get(pet_data, "lon")                # longitude
+lat <- ncvar_get(pet_data, "lat", verbose = F)   # latitude
+t <- ncvar_get(pet_data, "time")                 # time
+
+
+# Inspect the units that are used in the time dimension
+tunits <- ncatt_get(pet_data,"time","units")
+tunits
+
+#$hasatt
+#[1] TRUE
+
+#$value
+#[1] chr "days since 1900-1-1"
+
+# Store the dimensions of the time variable 
+nt <- dim(t)
+nt
+
+# 480 time units 
+
+# Look at the first few entries from the longitude variable
+head(lat) # 360 values (1st:-89.75) with 0.5 unit spacing
+head(lon) # 720 values(1st: -179.75) with 0.5 unit spacing
+head(t)
+
+# Extract the variable of interest (potential evapo-transpiration)
+pet.array <- ncvar_get(pet_data, "pet") # store the data in a 3-dimensional array
+
+# Checking the dimensions of the array
+dim(pet.array)
+
+# [1] 720 360 480
+# 720 longitudes, 360 latitudes, and 480 time units (12 months across 40 years)
+
+# See what fill value was used for missing data
+fillvalue <- ncatt_get(pet_data, "pet", "_FillValue")
+fillvalue
+
+#[1] 9.96921e+36
+
+# Replace missing values with the usual "NA"
+pet.array[pet.array == fillvalue$value] <- NA
+
+# Note: the array looks like it has loads of missing values. Check?
+head(pet.array)
+
+# Clear all
+#rm(list = ls())
+
+# Close the netCDF file
+nc_close(pet_data)
+
+```
+
+
+Understand the time variable
+
+Note: the way the time variable is coded in this dataset: each value is a number of days since 1900-1-1 in chronological order.
+
+```{r Process time variable, include=FALSE}
+
+# Convert time -- split the time units string into fields
+tustr <- strsplit(tunits$value, " ")
+tdstr <- strsplit(unlist(tustr)[3], "-")
+tmonth <- as.numeric(unlist(tdstr)[2])
+tday <- as.numeric(unlist(tdstr)[3])
+tyear <- as.numeric(unlist(tdstr)[1])
+
+#chron(time,origin=c(tmonth, tday, tyear))# note: this function does not seem to work with non-numeric or non-character values 
+
+
+# Check the number of non-NA values
+length(na.omit(as.vector(pet.array[,,1])))
+
+# [1] 66501
+```
+
+
+
+Convert PET into a data frame - name columns according to time steps (monthly data covering 1981-2020). 
+
+```{r Turn PET into a data frame}
+# Create a matrix of lon-lat pairs 
+lonlat <- as.matrix(expand.grid(lon,lat))
+dim(lonlat)
+
+# Make a vector with values for PET
+pet_vec <- as.vector(pet.array)
+length(pet_vec)
+
+# reshape the vector into a matrix
+pet_mat <- matrix(pet_vec, nrow=720*360, ncol=nt)
+dim(pet_mat)
+
+# Inspect the head of the matrix (excluding missing values)
+head(na.omit(pet_mat))
+
+# Create a dataframe using the lon-lat matrix 
+pet_df <- data.frame(cbind(lonlat,pet_mat))
+
+# Assign names according to the original time dimension of the data (days since 1900-1-1)
+names(pet_df) <- c("lon","lat", t)
+# options(width=96)
+head(na.omit(pet_df, 20))
+
+# Now we have a data frame where each column is a point in time (12 months over 40 years) - need to break those down into month and year 
+
+# Create a matrix of month-year combinations 
+
+months <- 1:12
+years <- 1981:2020
+month_names <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+month_year <- as.matrix(expand.grid(months,years))
+dim(month_year)
+
+# Make a list with all combinations of months and years 
+timeref <- list()
+
+# Need to start the loop with the year then month
+for (year in years) {
+  timeref[[length(timeref)+1]] <- paste(year, month_names)
+}
+
+
+# Turn a list into a vector
+timeref_vector <- unlist(timeref)
+
+# Assign month-year combinations as column names for identification
+names(pet_df) <- c("lon", "lat", timeref_vector)
+
+
+```
+
+
+Restrict sample to Tanzania - Create a data frame with just coordinates of households in the data. For that I need to load geographical coordinates of households. As these are at a higher spatial resolution than climatic data, I will aggregate to a 0.5 degrees grid.
+
+Or simply a spatial join?
+
+There are four Stata data files with coordinates corresponding to the first 4 Tanzanian waves (2008, 10, 12, 14/15).
+
+```{r}
+# Set directory
+setwd("C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Tanzania/Data/Household")
+
+# Import data file with coordinates of households across four waves
+TZ_geo_Y1 <- read_dta("HH.Geovariables_Y1.dta")
+TZ_geo_Y2 <- read_dta("HH.Geovariables_Y2.dta")
+TZ_geo_Y3 <- read_dta("HouseholdGeovars_Y3.dta")
+TZ_geo_Y4 <- read_dta("npsy4.ea.offset.dta")
+
+
+# Leave only coordinates
+TZ_geo_Y1 <- TZ_geo_Y1[, c("lon_modified", "lat_modified")]
+TZ_geo_Y2 <- TZ_geo_Y2[, c("lon_modified", "lat_modified")]
+TZ_geo_Y3 <- TZ_geo_Y3[, c("lon_dd_mod", "lat_dd_mod")]
+TZ_geo_Y4 <- TZ_geo_Y4[, c("lon_modified", "lat_modified")]
+
+# Function for assigning data points to the closest cell at a 0.5 degrees spatial resolution
+
+ji <- function(xy, origin=c(0,0), cellsize=c(0.5,0.5)) { #select 0.5 degree resolution
+  t(apply(xy, 1, function(z) cellsize/2+origin+cellsize*(floor((z - origin)/cellsize))))
+  
+}
+
+
+# Apply the function 
+JI <- ji(cbind(TZ_geo_Y1$lon_modified, TZ_geo_Y1$lat_modified))
+TZ_geo_Y1$X <- JI[, 1]
+TZ_geo_Y1$Y <- JI[, 2]
+
+JI <- ji(cbind(TZ_geo_Y2$lon_modified, TZ_geo_Y2$lat_modified))
+TZ_geo_Y2$X <- JI[, 1]
+TZ_geo_Y2$Y <- JI[, 2]
+
+JI <- ji(cbind(TZ_geo_Y3$lon_dd_mod, TZ_geo_Y3$lat_dd_mod))
+TZ_geo_Y3$X <- JI[, 1]
+TZ_geo_Y3$Y <- JI[, 2]
+
+JI <- ji(cbind(TZ_geo_Y4$lon_modified, TZ_geo_Y4$lat_modified))
+TZ_geo_Y4$X <- JI[, 1]
+TZ_geo_Y4$Y <- JI[, 2]
+
+# Create a data frame with just the aggregated 0.5 degrees grid cell points for Tanzania
+TZ_geo_Y1_0.5 <- TZ_geo_Y1[,3:4]
+TZ_geo_Y1_0.5 <- rename(TZ_geo_Y1_0.5, c("lon"="X",
+                      "lat"="Y"))
+
+TZ_geo_Y2_0.5 <- TZ_geo_Y2[,3:4]
+TZ_geo_Y2_0.5 <- rename(TZ_geo_Y2_0.5, c("lon"="X",
+                      "lat"="Y"))
+
+TZ_geo_Y3_0.5 <- TZ_geo_Y3[,3:4]
+TZ_geo_Y3_0.5 <- rename(TZ_geo_Y3_0.5, c("lon"="X",
+                      "lat"="Y"))
+
+TZ_geo_Y4_0.5 <- TZ_geo_Y4[,3:4]
+TZ_geo_Y4_0.5 <- rename(TZ_geo_Y4_0.5, c("lon"="X",
+                      "lat"="Y"))
+
+# Remove duplicates - keep only unique values
+TZ_geo_Y1_0.5 <- TZ_geo_Y1_0.5[!duplicated(TZ_geo_Y1_0.5[c(1,2)]),]
+TZ_geo_Y2_0.5 <- TZ_geo_Y2_0.5[!duplicated(TZ_geo_Y2_0.5[c(1,2)]),]
+TZ_geo_Y3_0.5 <- TZ_geo_Y3_0.5[!duplicated(TZ_geo_Y3_0.5[c(1,2)]),]
+TZ_geo_Y4_0.5 <- TZ_geo_Y4_0.5[!duplicated(TZ_geo_Y4_0.5[c(1,2)]),]
+
+
+# Now use a left join to assign values of the massive pet_df data frame only for points that are relevant for Nigeria (hiopefully will save space this way as well)
+pet_tanzania_Y1 <- left_join(TZ_geo_Y1_0.5, pet_df)
+pet_tanzania_Y2 <- left_join(TZ_geo_Y2_0.5, pet_df)
+pet_tanzania_Y3 <- left_join(TZ_geo_Y3_0.5, pet_df)
+pet_tanzania_Y4 <- left_join(TZ_geo_Y4_0.5, pet_df)
+
+```
+
+
+# Change the units of PET data. The documentation for CRU Version 4 climate data says PET is expressed in mm/day while Precipitation Rate is expressed in mm/month. Going to convert PET into monthly values to match precipitation.
+
+```{r Unit conversion PET}
+
+# Change daily values to monthly - multiply by 30.
+pet_tanzania_Y1[,3:482] <- pet_tanzania_Y1[,3:482]*30
+pet_tanzania_Y2[,3:482] <- pet_tanzania_Y2[,3:482]*30
+pet_tanzania_Y3[,3:482] <- pet_tanzania_Y3[,3:482]*30
+pet_tanzania_Y4[,3:482] <- pet_tanzania_Y4[,3:482]*30
+
+```
+
+
+
+## 2. Precipitation data ##
+
+# Load and process raw netCDF file with merged precipitation data (monthly for the period 1981-2020).
+
+```{r Open precipitation data, include=FALSE}
+# Set the working directory to .dat files as an experiment 
+setwd("C:/Users/idabr/OneDrive - Oxford Policy Management Limited/DEEP Multiple Crises Poverty Nigeria/Data/CRU Version 4 Climate Data/PRE (Precipitation)/Raw data")
+
+# Open the netCDF file. This has already been merged and covers the period 1981-2020. It contains 480 time steps (12 months across 40 years)
+pre_data <- nc_open("merged_pre.nc", write=FALSE, readunlim=TRUE, verbose=FALSE, 
+ 	auto_GMT=TRUE, suppress_dimvals=FALSE, return_on_error=FALSE )
+
+# Data has three dimensions: lon, lat, and time. The variable of interest is "pet" 
+
+# Extract variables - three dimensions 
+lon <- ncvar_get(pre_data, "lon")                # longitude
+lat <- ncvar_get(pre_data, "lat", verbose = F)   # latitude
+t <- ncvar_get(pre_data, "time")                 # time
+
+# Inspect the units that are used in the time dimension
+tunits <- ncatt_get(pre_data,"time","units")
+tunits
+
+#$hasatt
+#[1] TRUE
+
+#$value
+#[1] chr "days since 1900-1-1"
+
+# Store the dimensions of the time variable 
+nt <- dim(t)
+nt
+
+# 480 time units 
+
+# Look at the first few entries from the longitude variable
+head(lat) # 360 values (1st:-89.75) with 0.5 unit spacing
+head(lon) # 720 values(1st: -179.75) with 0.5 unit spacing
+head(t)
+
+# Extract the variable of interest (potential evapo-transpiration)
+pre.array <- ncvar_get(pre_data, "pre") # store the data in a 3-dimensional array
+
+# Checking the dimensions of the array
+dim(pre.array)
+
+# [1] 720 360 480
+# 720 longitudes, 360 latitudes, and 480 time units (12 months across 40 years)
+
+# See what fill value was used for missing data
+fillvalue <- ncatt_get(pre_data, "pre", "_FillValue")
+fillvalue
+
+#[1] 9.96921e+36
+
+# Make some space by removing the massive pet_data
+rm(pet_data)
+
+
+# Need more space - keep just objects for Nigeria
+rm(pet_mat, pet_df)
+rm(pet.array, pet_vec)
+
+# Replace missing values with the usual "NA"
+pre.array[pre.array == fillvalue$value] <- NA
+
+# Note: the array looks like it has loads of missing values. Check?
+head(pre.array)
+
+# Clear all
+#rm(list = ls())
+
+# Close the netCDF file
+nc_close(pre_data)
+```
+
+Turn the precipitation netCDF file into a data frame. Assign intuitive markers for time (months from 1981-2020).
+
+```{r Precipitation data frame, include=FALSE}
+
+# Make a vector with values for PRE
+pre_vec <- as.vector(pre.array)
+length(pre_vec)
+
+# reshape the vector into a matrix
+pre_mat <- matrix(pre_vec, nrow=720*360, ncol=nt)
+dim(pre_mat)
+
+# Create a dataframe using the lon-lat matrix 
+pre_df <- data.frame(cbind(lonlat,pre_mat))
+
+# Assign names according to the original time dimension of the data (days since 1900-1-1)
+names(pre_df) <- c("lon","lat", t)
+# options(width=96)
+head(na.omit(pre_df, 20))
+
+# Now we have a data frame where each column is a point in time (12 months over 40 years) - need to break those down into month and year 
+
+# Assign month-year combinations as column names for identification
+names(pre_df) <- c("lon", "lat", timeref_vector)
+```
+
+Restrict the sample to data points in Tanzania (more specifically the grid cells containing households)
+
+```{r Nigeria sample}
+# Now use a left join to assign values of the massive pet_df data frame only for points that are relevant for Tanzania 
+pre_tanzania_Y1 <- left_join(TZ_geo_Y1_0.5, pre_df)
+pre_tanzania_Y2 <- left_join(TZ_geo_Y2_0.5, pre_df)
+pre_tanzania_Y3 <- left_join(TZ_geo_Y3_0.5, pre_df)
+pre_tanzania_Y4 <- left_join(TZ_geo_Y4_0.5, pre_df)
+
+# Drop massive files from earlier - no longer needed
+#rm(pre_mat, pre_df, pre_data)
+```
+
+## 3. SPEI construction ##
+
+Construct SPEI using the SPEI package in R. As a first step I need a time series of the water balance (precipitation minus potential evapotranspiration). The two data frames with these variables have exactly the same dimensions so will subtract them from each other. 
+
+```{r Calculate water balance}
+# Subtract PET from precipitation
+water_balance_Y1 <- pre_tanzania_Y1[,3:482] - pet_tanzania_Y1[,3:482]
+water_balance_Y2 <- pre_tanzania_Y2[,3:482] - pet_tanzania_Y2[,3:482]
+water_balance_Y3 <- pre_tanzania_Y3[,3:482] - pet_tanzania_Y3[,3:482]
+water_balance_Y4 <- pre_tanzania_Y4[,3:482] - pet_tanzania_Y4[,3:482]
+
+# Append the longitude and latitude
+water_balance_Y1['lon'] <- pre_tanzania_Y1$lon
+water_balance_Y1['lat'] <- pre_tanzania_Y1$lat
+
+water_balance_Y2['lon'] <- pre_tanzania_Y2$lon
+water_balance_Y2['lat'] <- pre_tanzania_Y2$lat
+
+water_balance_Y3['lon'] <- pre_tanzania_Y3$lon
+water_balance_Y3['lat'] <- pre_tanzania_Y3$lat
+
+water_balance_Y4['lon'] <- pre_tanzania_Y4$lon
+water_balance_Y4['lat'] <- pre_tanzania_Y4$lat
+  
+# Move longitude and latitude to the front
+water_balance_Y1 <- water_balance_Y1 %>% 
+  relocate(lat)
+
+water_balance_Y1 <- water_balance_Y1 %>% 
+  relocate(lon)
+
+# Y2
+water_balance_Y2 <- water_balance_Y2 %>% 
+  relocate(lat)
+
+water_balance_Y2 <- water_balance_Y2 %>% 
+  relocate(lon)
+
+# Y3
+water_balance_Y3 <- water_balance_Y3 %>% 
+  relocate(lat)
+
+water_balance_Y3 <- water_balance_Y3 %>% 
+  relocate(lon)
+
+# Y4
+water_balance_Y4 <- water_balance_Y4 %>% 
+  relocate(lat)
+
+water_balance_Y4 <- water_balance_Y4 %>% 
+  relocate(lon)
+
+```
+
+Construct SPEI. Data needs to be in the following format: Water balance needs to be a column with monthly values of a time series. 
+
+SPEI package parameters:
+
+1) Scale parameter controls the influence of past values. For example, selecting 12 will take into account 12 previous months.
+2) Distribution parameter decides what kind of distribution the data should be fit to. For some reason, log-logistic returns all values while Gamma comes up with NA. I will use log-logistic below.
+3) Reference period: default will be taking into account the whole reference period of the data. In my case that is 1981-2020. 
+
+Note: do we want drought measured on different time scales? 1,2,3,4,5 year cumulative drought? 
+
+Brunckhorst (2020) uses a 12-month SPI. Take the value of December for each year.
+
+Try constructing SPEI for the whole water balance data frame. That means monthly data from back in 1981
+
+```{r}
+# Add the column for lon-lat
+water_balance_Y1$lonlat <- paste(water_balance_Y1$lon, water_balance_Y1$lat)
+water_balance_Y2$lonlat <- paste(water_balance_Y2$lon, water_balance_Y2$lat)
+water_balance_Y3$lonlat <- paste(water_balance_Y3$lon, water_balance_Y3$lat)
+water_balance_Y4$lonlat <- paste(water_balance_Y4$lon, water_balance_Y4$lat)
+
+# Delete individual lon-lat measurements
+water_balance_Y1 <- water_balance_Y1[,3:483]
+water_balance_Y2 <- water_balance_Y2[,3:483]
+water_balance_Y3 <- water_balance_Y3[,3:483]
+water_balance_Y4 <- water_balance_Y4[,3:483]
+
+# Move lon-lat to the front
+water_balance_Y1 <- water_balance_Y1 %>% 
+  relocate(lonlat)
+water_balance_Y2 <- water_balance_Y2 %>% 
+  relocate(lonlat)
+water_balance_Y3 <- water_balance_Y3 %>% 
+  relocate(lonlat)
+water_balance_Y4 <- water_balance_Y4 %>% 
+  relocate(lonlat)
+
+# Transpose to make time-series a column
+water_balance_long_Y1 <- as.data.frame(t(water_balance_Y1))
+water_balance_long_Y2 <- as.data.frame(t(water_balance_Y2))
+water_balance_long_Y3 <- as.data.frame(t(water_balance_Y3))
+water_balance_long_Y4 <- as.data.frame(t(water_balance_Y4))
+
+# Make column names lon-lat
+names(water_balance_long_Y1) <- water_balance_long_Y1[1,]
+names(water_balance_long_Y2) <- water_balance_long_Y2[1,]
+names(water_balance_long_Y3) <- water_balance_long_Y3[1,]
+names(water_balance_long_Y4) <- water_balance_long_Y4[1,]
+
+# Make columns numeric values
+water_balance_long_Y1 <- sapply(water_balance_long_Y1, as.numeric)
+water_balance_long_Y2 <- sapply(water_balance_long_Y2, as.numeric)
+water_balance_long_Y3 <- sapply(water_balance_long_Y3, as.numeric)
+water_balance_long_Y4 <- sapply(water_balance_long_Y4, as.numeric)
+
+# Remove lon-lat
+water_balance_long_Y1 <- water_balance_long_Y1[-1,]
+water_balance_long_Y2 <- water_balance_long_Y2[-1,]
+water_balance_long_Y3 <- water_balance_long_Y3[-1,]
+water_balance_long_Y4 <- water_balance_long_Y4[-1,]
+
+
+# Declare water balance a time series, specifying the start and end point
+water_balance_long_Y1 <- ts(water_balance_long_Y1, start=c(1981,1), end=c(2020,12), frequency=12)
+water_balance_long_Y2 <- ts(water_balance_long_Y2, start=c(1981,1), end=c(2020,12), frequency=12)
+water_balance_long_Y3 <- ts(water_balance_long_Y3, start=c(1981,1), end=c(2020,12), frequency=12)
+water_balance_long_Y4 <- ts(water_balance_long_Y4, start=c(1981,1), end=c(2020,12), frequency=12)
+
+```
+
+
+Calculate 12-month Dec SPEI for all years 2000-2015. In order not to spend 3 years on this, it would be useful to have a loop that goes through these individual years, calcultes SPEI and saves the result as a column in a data frame with lon-lat and X-Y combinations - to be merged back into household data.
+
+
+Practice loop below:
+
+```{r}
+# Store the sequence of years in a vector
+s_years <- 2000:2020  # values of years for which we want SPEI values 
+years <- 1981:2020   # historical reference period
+
+# Create a sequence of months
+all_months <- vec_rep(month_names, 40)
+
+# Create a sequence of years
+all_years <- rep(years,each=12)
+
+
+# Create a list to store fitted values
+fitted_list <- list()
+
+# Loop time
+
+for (i in s_years) {
+spei_list <- spei(water_balance_long_Y1, 12, kernel = list(type = 'rectangular', shift = 0),  # Calculate 12-month SPEI 
+distribution = 'log-Logistic', fit = 'ub-pwm', na.rm = TRUE,
+ref.start=NULL, ref.end=c(i,12), x=FALSE, params=NULL)  # historical reference period going back to 1981
+fitted <- spei_list$fitted 
+fitted <- as.data.frame(fitted) 
+fitted$month <- all_months
+fitted$year <- all_years
+data <- fitted %>% filter(month =="Dec" & year==i)
+data <- data[,1:158]   # remove the last two values (lon and lat)
+data <- as.data.frame(t(data))
+data$lon <- pet_tanzania_Y1$lon   # Assign lon and lat
+data$lat <- pet_tanzania_Y1$lat
+fitted_list[[i-1999]] <- data   # your first year-1
+
+}
+
+
+# Prepare a data frame
+spei_2000_2020_Y1 <- fitted_list[[1]]
+spei_2000_2020_Y1 <- rename(spei_2000_2020_Y1, "SPEI_2000" = "V1")
+
+
+values <- list()
+for (i in s_years) {
+  values[[i-1999]] <- fitted_list[[i-1999]]$V1   
+}
+
+spei_2000_2020_Y1$SPEI_2001 <- values[[2]]
+spei_2000_2020_Y1$SPEI_2002 <- values[[3]]
+spei_2000_2020_Y1$SPEI_2003 <- values[[4]]
+spei_2000_2020_Y1$SPEI_2004 <- values[[5]]
+spei_2000_2020_Y1$SPEI_2005 <- values[[6]]
+spei_2000_2020_Y1$SPEI_2006 <- values[[7]]
+spei_2000_2020_Y1$SPEI_2007 <- values[[8]]
+spei_2000_2020_Y1$SPEI_2008 <- values[[9]]
+spei_2000_2020_Y1$SPEI_2009 <- values[[10]]
+spei_2000_2020_Y1$SPEI_2010 <- values[[11]]
+spei_2000_2020_Y1$SPEI_2011 <- values[[12]]
+spei_2000_2020_Y1$SPEI_2012 <- values[[13]]
+spei_2000_2020_Y1$SPEI_2013 <- values[[14]]
+spei_2000_2020_Y1$SPEI_2014 <- values[[15]]
+spei_2000_2020_Y1$SPEI_2015 <- values[[16]]
+spei_2000_2020_Y1$SPEI_2016 <- values[[17]]
+spei_2000_2020_Y1$SPEI_2017 <- values[[18]]
+spei_2000_2020_Y1$SPEI_2018 <- values[[19]]
+spei_2000_2020_Y1$SPEI_2019 <- values[[20]]
+spei_2000_2020_Y1$SPEI_2020 <- values[[21]]
+
+
+# Rename rows
+rownames(spei_2000_2020_Y1) <- 1:nrow(spei_2000_2020_Y1)
+
+# Rename columns for consistency before the left join
+spei_2000_2020_Y1 <- rename(spei_2000_2020_Y1, c("X" = "lon",
+                                     "Y" = "lat"))
+
+duplicated(spei_2000_2020_Y1)
+
+# Left join with actual geo-located values from GHS
+spei_2000_2020_Y1 <- left_join(TZ_geo_Y1, spei_2000_2020_Y1)
+
+spei_2000_2020_Y1$X <- as.numeric(spei_2000_2020_Y1$X)
+spei_2000_2020_Y1$Y <- as.numeric(spei_2000_2020_Y1$Y)
+
+# Save the .dta file with SPEI values from 2005-2018
+write.dta(spei_2000_2020_Y1, "HH.Geovariables_Y1_SPEI.dta")
+
+
+```
+
+
+Repeat for Y2 (one day this code will be more efficient but rn we are in a rush)
+
+```{r}
+# Store the sequence of years in a vector
+s_years <- 2000:2020  # values of years for which we want SPEI values 
+years <- 1981:2020   # historical reference period
+
+# Create a sequence of months
+all_months <- vec_rep(month_names, 40)
+
+# Create a sequence of years
+all_years <- rep(years,each=12)
+
+
+# Create a list to store fitted values
+fitted_list <- list()
+
+# Loop time
+
+for (i in s_years) {
+spei_list <- spei(water_balance_long_Y2, 12, kernel = list(type = 'rectangular', shift = 0),  # Calculate 12-month SPEI 
+distribution = 'log-Logistic', fit = 'ub-pwm', na.rm = TRUE,
+ref.start=NULL, ref.end=c(i,12), x=FALSE, params=NULL)  # historical reference period going back to 1981
+fitted <- spei_list$fitted 
+fitted <- as.data.frame(fitted) 
+fitted$month <- all_months
+fitted$year <- all_years
+data <- fitted %>% filter(month =="Dec" & year==i)
+data <- data[,1:195]   # remove the last two values (lon and lat)
+data <- as.data.frame(t(data))
+data$lon <- pet_tanzania_Y2$lon   # Assign lon and lat
+data$lat <- pet_tanzania_Y2$lat
+fitted_list[[i-1999]] <- data   # your first year-1
+
+}
+
+
+# Prepare a data frame
+spei_2000_2020_Y2 <- fitted_list[[1]]
+spei_2000_2020_Y2 <- rename(spei_2000_2020_Y2, "SPEI_2000" = "V1")
+
+
+values <- list()
+for (i in s_years) {
+  values[[i-1999]] <- fitted_list[[i-1999]]$V1   
+}
+
+spei_2000_2020_Y2$SPEI_2001 <- values[[2]]
+spei_2000_2020_Y2$SPEI_2002 <- values[[3]]
+spei_2000_2020_Y2$SPEI_2003 <- values[[4]]
+spei_2000_2020_Y2$SPEI_2004 <- values[[5]]
+spei_2000_2020_Y2$SPEI_2005 <- values[[6]]
+spei_2000_2020_Y2$SPEI_2006 <- values[[7]]
+spei_2000_2020_Y2$SPEI_2007 <- values[[8]]
+spei_2000_2020_Y2$SPEI_2008 <- values[[9]]
+spei_2000_2020_Y2$SPEI_2009 <- values[[10]]
+spei_2000_2020_Y2$SPEI_2010 <- values[[11]]
+spei_2000_2020_Y2$SPEI_2011 <- values[[12]]
+spei_2000_2020_Y2$SPEI_2012 <- values[[13]]
+spei_2000_2020_Y2$SPEI_2013 <- values[[14]]
+spei_2000_2020_Y2$SPEI_2014 <- values[[15]]
+spei_2000_2020_Y2$SPEI_2015 <- values[[16]]
+spei_2000_2020_Y2$SPEI_2016 <- values[[17]]
+spei_2000_2020_Y2$SPEI_2017 <- values[[18]]
+spei_2000_2020_Y2$SPEI_2018 <- values[[19]]
+spei_2000_2020_Y2$SPEI_2019 <- values[[20]]
+spei_2000_2020_Y2$SPEI_2020 <- values[[21]]
+
+
+# Rename rows
+rownames(spei_2000_2020_Y2) <- 1:nrow(spei_2000_2020_Y2)
+
+# Rename columns for consistency before the left join
+spei_2000_2020_Y2 <- rename(spei_2000_2020_Y2, c("X" = "lon",
+                                     "Y" = "lat"))
+
+duplicated(spei_2000_2020_Y2)
+
+# Left join with actual geo-located values from GHS
+spei_2000_2020_Y2 <- left_join(TZ_geo_Y2, spei_2000_2020_Y2)
+
+spei_2000_2020_Y2$X <- as.numeric(spei_2000_2020_Y2$X)
+spei_2000_2020_Y2$Y <- as.numeric(spei_2000_2020_Y2$Y)
+
+# Save the .dta file with SPEI values from 2005-2018
+write.dta(spei_2000_2020_Y2, "HH.Geovariables_Y2_SPEI.dta")
+
+```
+
+
+Repeat for Y3
+
+```{r}
+# Store the sequence of years in a vector
+s_years <- 2000:2020  # values of years for which we want SPEI values 
+years <- 1981:2020   # historical reference period
+
+# Create a sequence of months
+all_months <- vec_rep(month_names, 40)
+
+# Create a sequence of years
+all_years <- rep(years,each=12)
+
+
+# Create a list to store fitted values
+fitted_list <- list()
+
+# Loop time
+
+for (i in s_years) {
+spei_list <- spei(water_balance_long_Y3, 12, kernel = list(type = 'rectangular', shift = 0),  # Calculate 12-month SPEI 
+distribution = 'log-Logistic', fit = 'ub-pwm', na.rm = TRUE,
+ref.start=NULL, ref.end=c(i,12), x=FALSE, params=NULL)  # historical reference period going back to 1981
+fitted <- spei_list$fitted 
+fitted <- as.data.frame(fitted) 
+fitted$month <- all_months
+fitted$year <- all_years
+data <- fitted %>% filter(month =="Dec" & year==i)
+data <- data[,1:224]   # remove the last two values (lon and lat)
+data <- as.data.frame(t(data))
+data$lon <- pet_tanzania_Y3$lon   # Assign lon and lat
+data$lat <- pet_tanzania_Y3$lat
+fitted_list[[i-1999]] <- data   # your first year-1
+
+}
+
+
+# Prepare a data frame
+spei_2000_2020_Y3 <- fitted_list[[1]]
+spei_2000_2020_Y3 <- rename(spei_2000_2020_Y3, "SPEI_2000" = "V1")
+
+
+values <- list()
+for (i in s_years) {
+  values[[i-1999]] <- fitted_list[[i-1999]]$V1   
+}
+
+spei_2000_2020_Y3$SPEI_2001 <- values[[2]]
+spei_2000_2020_Y3$SPEI_2002 <- values[[3]]
+spei_2000_2020_Y3$SPEI_2003 <- values[[4]]
+spei_2000_2020_Y3$SPEI_2004 <- values[[5]]
+spei_2000_2020_Y3$SPEI_2005 <- values[[6]]
+spei_2000_2020_Y3$SPEI_2006 <- values[[7]]
+spei_2000_2020_Y3$SPEI_2007 <- values[[8]]
+spei_2000_2020_Y3$SPEI_2008 <- values[[9]]
+spei_2000_2020_Y3$SPEI_2009 <- values[[10]]
+spei_2000_2020_Y3$SPEI_2010 <- values[[11]]
+spei_2000_2020_Y3$SPEI_2011 <- values[[12]]
+spei_2000_2020_Y3$SPEI_2012 <- values[[13]]
+spei_2000_2020_Y3$SPEI_2013 <- values[[14]]
+spei_2000_2020_Y3$SPEI_2014 <- values[[15]]
+spei_2000_2020_Y3$SPEI_2015 <- values[[16]]
+spei_2000_2020_Y3$SPEI_2016 <- values[[17]]
+spei_2000_2020_Y3$SPEI_2017 <- values[[18]]
+spei_2000_2020_Y3$SPEI_2018 <- values[[19]]
+spei_2000_2020_Y3$SPEI_2019 <- values[[20]]
+spei_2000_2020_Y3$SPEI_2020 <- values[[21]]
+
+
+# Rename rows
+rownames(spei_2000_2020_Y3) <- 1:nrow(spei_2000_2020_Y3)
+
+# Rename columns for consistency before the left join
+spei_2000_2020_Y3 <- rename(spei_2000_2020_Y3, c("X" = "lon",
+                                     "Y" = "lat"))
+
+duplicated(spei_2000_2020_Y3)
+
+# Left join with actual geo-located values from GHS
+spei_2000_2020_Y3 <- left_join(TZ_geo_Y3, spei_2000_2020_Y3)
+
+spei_2000_2020_Y3$X <- as.numeric(spei_2000_2020_Y3$X)
+spei_2000_2020_Y3$Y <- as.numeric(spei_2000_2020_Y3$Y)
+
+# Save the .dta file with SPEI values from 2000-2020
+write.dta(spei_2000_2020_Y3, "HouseholdGeovars_Y3_SPEI.dta")
+```
+
+Finally Y4 
+
+```{r}
+# Store the sequence of years in a vector
+s_years <- 2000:2020  # values of years for which we want SPEI values 
+years <- 1981:2020   # historical reference period
+
+# Create a sequence of months
+all_months <- vec_rep(month_names, 40)
+
+# Create a sequence of years
+all_years <- rep(years,each=12)
+
+
+# Create a list to store fitted values
+fitted_list <- list()
+
+# Loop time
+
+for (i in s_years) {
+spei_list <- spei(water_balance_long_Y4, 12, kernel = list(type = 'rectangular', shift = 0),  # Calculate 12-month SPEI 
+distribution = 'log-Logistic', fit = 'ub-pwm', na.rm = TRUE,
+ref.start=NULL, ref.end=c(i,12), x=FALSE, params=NULL)  # historical reference period going back to 1981
+fitted <- spei_list$fitted 
+fitted <- as.data.frame(fitted) 
+fitted$month <- all_months
+fitted$year <- all_years
+data <- fitted %>% filter(month =="Dec" & year==i)
+data <- data[,1:161]   # remove the last two values (lon and lat)
+data <- as.data.frame(t(data))
+data$lon <- pet_tanzania_Y4$lon   # Assign lon and lat
+data$lat <- pet_tanzania_Y4$lat
+fitted_list[[i-1999]] <- data   # your first year-1
+
+}
+
+
+# Prepare a data frame
+spei_2000_2020_Y4 <- fitted_list[[1]]
+spei_2000_2020_Y4 <- rename(spei_2000_2020_Y4, "SPEI_2000" = "V1")
+
+
+values <- list()
+for (i in s_years) {
+  values[[i-1999]] <- fitted_list[[i-1999]]$V1   
+}
+
+spei_2000_2020_Y4$SPEI_2001 <- values[[2]]
+spei_2000_2020_Y4$SPEI_2002 <- values[[3]]
+spei_2000_2020_Y4$SPEI_2003 <- values[[4]]
+spei_2000_2020_Y4$SPEI_2004 <- values[[5]]
+spei_2000_2020_Y4$SPEI_2005 <- values[[6]]
+spei_2000_2020_Y4$SPEI_2006 <- values[[7]]
+spei_2000_2020_Y4$SPEI_2007 <- values[[8]]
+spei_2000_2020_Y4$SPEI_2008 <- values[[9]]
+spei_2000_2020_Y4$SPEI_2009 <- values[[10]]
+spei_2000_2020_Y4$SPEI_2010 <- values[[11]]
+spei_2000_2020_Y4$SPEI_2011 <- values[[12]]
+spei_2000_2020_Y4$SPEI_2012 <- values[[13]]
+spei_2000_2020_Y4$SPEI_2013 <- values[[14]]
+spei_2000_2020_Y4$SPEI_2014 <- values[[15]]
+spei_2000_2020_Y4$SPEI_2015 <- values[[16]]
+spei_2000_2020_Y4$SPEI_2016 <- values[[17]]
+spei_2000_2020_Y4$SPEI_2017 <- values[[18]]
+spei_2000_2020_Y4$SPEI_2018 <- values[[19]]
+spei_2000_2020_Y4$SPEI_2019 <- values[[20]]
+spei_2000_2020_Y4$SPEI_2020 <- values[[21]]
+
+
+# Rename rows
+rownames(spei_2000_2020_Y4) <- 1:nrow(spei_2000_2020_Y4)
+
+# Rename columns for consistency before the left join
+spei_2000_2020_Y4 <- rename(spei_2000_2020_Y4, c("X" = "lon",
+                                     "Y" = "lat"))
+
+duplicated(spei_2000_2020_Y4)
+
+# Left join with actual geo-located values from GHS
+spei_2000_2020_Y4 <- left_join(TZ_geo_Y4, spei_2000_2020_Y4)
+
+spei_2000_2020_Y4$X <- as.numeric(spei_2000_2020_Y4$X)
+spei_2000_2020_Y4$Y <- as.numeric(spei_2000_2020_Y4$Y)
+
+# Save the .dta file with SPEI values from 2000-2020
+write.dta(spei_2000_2020_Y4, "npsy4.ea.offset_SPEI.dta")
+```
+
